@@ -1,0 +1,4 @@
+# Build output
+/target/
+# Local copy of the release exe (published via GitHub Releases instead)
+/dist/
