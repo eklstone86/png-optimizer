@@ -116,7 +116,8 @@ impl Default for Prefs {
 enum Status {
     Idle,
     Queued,
-    Working,
+    /// Being processed since this moment (drives the animated badge and its timer).
+    Working(Instant),
     Done(Outcome),
     Cancelled,
     Error(String),
@@ -312,7 +313,7 @@ impl App {
         let mut finished = false;
         while let Ok(msg) = run.rx.try_recv() {
             match msg {
-                Msg::Started(i) => self.rows[i].status = Status::Working,
+                Msg::Started(i) => self.rows[i].status = Status::Working(Instant::now()),
                 Msg::Finished(i, r) => {
                     run.done += 1;
                     self.rows[i].status = match r {
@@ -560,7 +561,7 @@ impl App {
                     .column(Column::exact(100.0))
                     .column(Column::exact(80.0))
                     .column(Column::exact(80.0))
-                    .column(Column::exact(150.0).clip(true))
+                    .column(Column::exact(176.0).clip(true))
             };
             table
                 .header(32.0, |mut h| {
@@ -663,8 +664,11 @@ impl App {
                         }
                         row.col(|ui| {
                             let cell = ui.max_rect();
-                            if let Some((label, tone)) = status_badge(&r.status) {
-                                let rect = pill(ui, egui::pos2(cell.left() + CELL_PAD, cell.center().y), label, tone);
+                            let at = egui::pos2(cell.left() + CELL_PAD, cell.center().y);
+                            if let Status::Working(since) = r.status {
+                                working_pill(ui, at, since.elapsed(), cell.right() - at.x);
+                            } else if let Some((label, tone)) = status_badge(&r.status) {
+                                let rect = pill(ui, at, label, tone);
                                 if let Some(why) = status_hint(&r.status, r.colors_in) {
                                     ui.interact(rect, ui.id().with(("status", i)), Sense::hover()).on_hover_text(why);
                                 }
@@ -759,6 +763,9 @@ impl eframe::App for App {
         system::theme(dark, self.accent).install(&ctx);
         self.poll();
         self.poll_scan();
+        if self.rows.iter().any(|r| matches!(r.status, Status::Working(_))) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // animated Processing badges
+        }
 
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() {
@@ -898,6 +905,54 @@ fn pill_size(ui: &egui::Ui, label: &str) -> egui::Vec2 {
 }
 
 /// Status pill painted with its vertical center on `left_center.y`. Returns its rect.
+/// Animated "Processing" badge: a spinning arc, a slowly breathing fill and the elapsed time,
+/// so long files visibly make progress. Drops the word, then the timer, when the cell is narrow.
+fn working_pill(ui: &egui::Ui, left_center: egui::Pos2, elapsed: std::time::Duration, max_w: f32) {
+    let theme = Theme::current(ui.ctx());
+    let fg = theme.palette.focus;
+    let t = ui.input(|i| i.time) as f32;
+    let font = egui::FontId::proportional(theme.typography.small);
+    let secs = elapsed.as_secs();
+    let timer = format!("{}:{:02}", secs / 60, secs % 60);
+
+    let pad = PILL_PAD;
+    let spin_d = font.size;
+    let gap = 6.0;
+    let measure = |s: &str| ui.painter().layout_no_wrap(s.to_owned(), font.clone(), fg).size();
+    let candidates = [format!("PROCESSING {timer}"), timer.clone(), String::new()];
+    let text = candidates
+        .into_iter()
+        .find(|s| s.is_empty() || pad.x * 2.0 + spin_d + gap + measure(s).x <= max_w)
+        .unwrap_or_default();
+    let text_size = if text.is_empty() { egui::vec2(0.0, measure("0").y) } else { measure(&text) };
+    let w = pad.x * 2.0 + spin_d + if text.is_empty() { 0.0 } else { gap + text_size.x };
+    let h = text_size.y + pad.y * 2.0;
+    let rect = egui::Rect::from_min_size(egui::pos2(left_center.x, left_center.y - h / 2.0), egui::vec2(w, h));
+    let painter = ui.painter();
+
+    // Breathing fill: 0.12 … 0.26 opacity over ~1.6 s.
+    let breath = 0.19 + 0.07 * (t * std::f32::consts::TAU / 1.6).sin();
+    painter.rect_filled(rect, h / 2.0, fg.gamma_multiply(breath));
+
+    // Spinner: a 100° arc rotating once per second around a faint full ring.
+    let c = egui::pos2(rect.left() + pad.x + spin_d / 2.0, rect.center().y);
+    let rad = spin_d / 2.0 - 1.0;
+    painter.circle_stroke(c, rad, egui::Stroke::new(2.0, fg.gamma_multiply(0.25)));
+    let start = t * std::f32::consts::TAU;
+    let arc: Vec<egui::Pos2> = (0..=16)
+        .map(|k| {
+            let a = start + 100f32.to_radians() * k as f32 / 16.0;
+            c + egui::vec2(a.cos(), a.sin()) * rad
+        })
+        .collect();
+    painter.add(egui::Shape::line(arc, egui::Stroke::new(2.0, fg)));
+
+    if !text.is_empty() {
+        let pos = egui::pos2(c.x + spin_d / 2.0 + gap, rect.center().y - text_size.y / 2.0);
+        painter.text(pos, egui::Align2::LEFT_TOP, text, font, fg);
+    }
+}
+
 fn pill(ui: &egui::Ui, left_center: egui::Pos2, label: &str, tone: BadgeTone) -> egui::Rect {
     let theme = Theme::current(ui.ctx());
     let p = theme.palette;
@@ -1046,7 +1101,7 @@ fn status_badge(s: &Status) -> Option<(&'static str, BadgeTone)> {
     Some(match s {
         Status::Idle => return None,
         Status::Queued => ("Queued", BadgeTone::Neutral),
-        Status::Working => ("Processing", BadgeTone::Info),
+        Status::Working(_) => ("Processing", BadgeTone::Info),
         Status::Done(Outcome::Optimized { first_frame: true, .. }) => ("First frame", BadgeTone::Warning),
         Status::Done(Outcome::Optimized { converted: true, .. }) => ("Converted", BadgeTone::Ok),
         Status::Done(Outcome::Optimized { note: "", .. }) => ("Optimized", BadgeTone::Ok),
