@@ -926,9 +926,10 @@ fn working_pill(ui: &egui::Ui, left_center: egui::Pos2, elapsed: std::time::Dura
         .into_iter()
         .find(|s| s.is_empty() || text_x + measure(s).x + pad.x <= max_w)
         .unwrap_or_default();
-    let text_size = if text.is_empty() { egui::vec2(0.0, h - pad.y * 2.0) } else { measure(&text) };
-    let w = if text.is_empty() { h } else { text_x + text_size.x + pad.x };
-    let rect = egui::Rect::from_min_size(egui::pos2(left_center.x, left_center.y - h / 2.0), egui::vec2(w, h));
+    let galley = ui.painter().layout_no_wrap(if text.is_empty() { "0".into() } else { text.clone() }, font.clone(), fg);
+    let w = if text.is_empty() { h } else { text_x + galley.size().x + pad.x };
+    let (rect, text_pos) = pill_geometry(ui, left_center, w, &galley, font.size);
+    let h = rect.height(); // pixel-exact height (may be one physical pixel taller)
     let painter = ui.painter();
 
     // Breathing fill: 0.12 … 0.26 opacity over ~1.6 s.
@@ -937,10 +938,9 @@ fn working_pill(ui: &egui::Ui, left_center: egui::Pos2, elapsed: std::time::Dura
 
     // Spinner: a 100° arc rotating once per second around a faint full ring, centered on the round
     // end so the gap to the pill's edge is the same all around.
-    // Snap the center to a physical pixel center so the antialiased ring doesn't lean half a pixel.
-    let ppp = ui.ctx().pixels_per_point();
-    let snap = |v: f32| ((v * ppp).floor() + 0.5) / ppp;
-    let c = egui::pos2(snap(rect.left() + h / 2.0), snap(rect.center().y));
+    // Concentric with the round end; rect is pixel-aligned with an odd/even-matched height,
+    // so this center lands exactly where the round end's center is.
+    let c = egui::pos2(rect.left() + h / 2.0, rect.center().y);
     let stroke_w = 1.75;
     painter.circle_stroke(c, rad, egui::Stroke::new(stroke_w, fg.gamma_multiply(0.25)));
     let start = t * std::f32::consts::TAU;
@@ -953,24 +953,33 @@ fn working_pill(ui: &egui::Ui, left_center: egui::Pos2, elapsed: std::time::Dura
     painter.add(egui::Shape::line(arc, egui::Stroke::new(stroke_w, fg)));
 
     if !text.is_empty() {
-        let galley = painter.layout_no_wrap(text, font.clone(), fg);
-        let pos = caps_centered(&galley, font.size, rect.left() + text_x, c.y);
-        painter.galley(pos, galley, fg);
+        painter.galley(egui::pos2(rect.left() + text_x, text_pos.y), galley, fg);
     }
 }
 
-/// Top-left for drawing an all-caps/digits galley so the capitals (not the line box, which also
-/// reserves room for descenders) are vertically centered on center_y.
-fn caps_centered(galley: &egui::Galley, font_size: f32, x: f32, center_y: f32) -> egui::Pos2 {
-    const CAP_HEIGHT: f32 = 0.70; // Segoe UI cap height, in ems
-    let baseline = galley
+/// Pixel-exact geometry for a pill holding an all-caps/digits label: returns the pill rect and the
+/// galley position. Centering the line box leaves capitals low (it reserves room for descenders),
+/// and an odd leftover pixel makes labels drift by half a pixel. So the capitals are centered in
+/// physical pixels, and the pill height gets the same parity as the cap height so both gaps match.
+fn pill_geometry(ui: &egui::Ui, left_center: egui::Pos2, width: f32, galley: &egui::Galley, font_size: f32) -> (egui::Rect, egui::Pos2) {
+    const CAP_HEIGHT: f32 = 0.70; // Segoe UI capitals, in ems (measured: 15 px at a 21 px font)
+    let ppp = ui.ctx().pixels_per_point();
+    let cap = (CAP_HEIGHT * font_size * ppp).round();
+    let mut h = ((galley.size().y + 2.0 * PILL_PAD.y) * ppp).round();
+    if (h - cap) % 2.0 != 0.0 {
+        h += 1.0;
+    }
+    let top = (left_center.y * ppp - h / 2.0).round();
+    let x = (left_center.x * ppp).round() / ppp;
+    let rect = egui::Rect::from_min_size(egui::pos2(x, top / ppp), egui::vec2(width, h / ppp));
+    let baseline = (top + (h - cap) / 2.0 + cap) / ppp;
+    let galley_baseline = galley
         .rows
         .first()
         .and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y))
         .unwrap_or(galley.size().y * 0.8);
-    egui::pos2(x, center_y - (baseline - CAP_HEIGHT * font_size / 2.0))
+    (rect, egui::pos2(0.0, baseline - galley_baseline))
 }
-
 fn pill(ui: &egui::Ui, left_center: egui::Pos2, label: &str, tone: BadgeTone) -> egui::Rect {
     let theme = Theme::current(ui.ctx());
     let p = theme.palette;
@@ -984,11 +993,9 @@ fn pill(ui: &egui::Ui, left_center: egui::Pos2, label: &str, tone: BadgeTone) ->
     let font = egui::FontId::proportional(theme.typography.small);
     let galley = ui.painter().layout_no_wrap(label.to_uppercase(), font.clone(), fg);
     let pad = PILL_PAD;
-    let size = galley.size() + 2.0 * pad;
-    let rect = egui::Rect::from_min_size(egui::pos2(left_center.x, left_center.y - size.y / 2.0), size);
-    ui.painter().rect_filled(rect, size.y / 2.0, fg.gamma_multiply(0.16));
-    let pos = caps_centered(&galley, font.size, rect.left() + pad.x, rect.center().y);
-    ui.painter().galley(pos, galley, fg);
+    let (rect, text_pos) = pill_geometry(ui, left_center, galley.size().x + 2.0 * pad.x, &galley, font.size);
+    ui.painter().rect_filled(rect, rect.height() / 2.0, fg.gamma_multiply(0.16));
+    ui.painter().galley(egui::pos2(rect.left() + pad.x, text_pos.y), galley, fg);
     rect
 }
 
