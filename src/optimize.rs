@@ -246,6 +246,13 @@ fn verified(original_alpha: &[u8], png: &[u8]) -> Result<Option<usize>, String> 
     Ok(alpha::verify(original_alpha, &img.alpha()).then(|| count_colors(&img.rgba)))
 }
 
+/// Color count of an image file on disk (any supported format), for showing before processing.
+pub fn count_file_colors(path: &Path) -> Result<usize, String> {
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    let img = if is_png(path) { decode(&data)? } else { decode_other(path, &data)?.0 };
+    Ok(count_colors(&img.rgba))
+}
+
 /// Distinct RGBA colors; every fully transparent pixel counts as the same color.
 pub fn count_colors(rgba: &[imagequant::RGBA]) -> usize {
     let mut seen = std::collections::HashSet::with_capacity(1024);

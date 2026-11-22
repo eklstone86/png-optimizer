@@ -127,6 +127,8 @@ struct Row {
     checked: bool,
     selected: bool,
     size_in: u64,
+    /// Colors in the file as it is on disk before the run (counted in the background when added).
+    colors_in: Option<usize>,
     status: Status,
 }
 
@@ -157,6 +159,10 @@ struct App {
     switches_w: Option<f32>,
     /// Row a Shift+click range starts from (the last plain or Ctrl click), like in Explorer.
     anchor: Option<usize>,
+    /// Background color counting of newly added files: (path, colors) as they finish.
+    scan_tx: mpsc::Sender<(PathBuf, usize)>,
+    scan_rx: mpsc::Receiver<(PathBuf, usize)>,
+    ctx: egui::Context,
 }
 
 impl App {
@@ -165,7 +171,20 @@ impl App {
         system::theme(system_is_dark(&cc.egui_ctx), accent).install(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         let prefs = cc.storage.and_then(|s| eframe::get_value(s, PREFS_KEY)).unwrap_or_default();
-        let mut app = Self { prefs, rows: Vec::new(), run: None, last_summary: None, accent, title_bar_dark: None, switches_w: None, anchor: None };
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let mut app = Self {
+            prefs,
+            rows: Vec::new(),
+            run: None,
+            last_summary: None,
+            accent,
+            title_bar_dark: None,
+            switches_w: None,
+            anchor: None,
+            scan_tx,
+            scan_rx,
+            ctx: cc.egui_ctx.clone(),
+        };
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
         app.add_paths(args);
         app
@@ -188,14 +207,42 @@ impl App {
                 found.push(p);
             }
         }
+        let mut added = Vec::new();
         for p in found {
             let p = std::path::absolute(&p).unwrap_or(p);
             if known.insert(key(&p)) {
                 let size_in = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                self.rows.push(Row { path: p, checked: true, selected: false, size_in, status: Status::Idle });
+                added.push(p.clone());
+                self.rows.push(Row { path: p, checked: true, selected: false, size_in, colors_in: None, status: Status::Idle });
             }
         }
         self.last_summary = None;
+        self.scan_colors(added);
+    }
+
+    /// Counts colors of the given files in the background; results arrive via `poll_scan`.
+    fn scan_colors(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let (tx, ctx) = (self.scan_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            paths.into_par_iter().for_each_with(tx, |tx, p| {
+                if let Ok(n) = optimize::count_file_colors(&p) {
+                    let _ = tx.send((p, n));
+                    ctx.request_repaint();
+                }
+            });
+        });
+    }
+
+    fn poll_scan(&mut self) {
+        while let Ok((path, n)) = self.scan_rx.try_recv() {
+            // Rows may have been removed or reordered meanwhile, so match by path.
+            if let Some(r) = self.rows.iter_mut().find(|r| r.path == path) {
+                r.colors_in = Some(n);
+            }
+        }
     }
 
     fn pick_files(&mut self) {
@@ -218,6 +265,12 @@ impl App {
         }
         for &(i, _) in &jobs {
             let r = &mut self.rows[i];
+            // After an in-place run the file on disk is the previous result: that's the new "before".
+            if let Status::Done(Outcome::Optimized { output, colors, .. }) = &r.status
+                && *output == r.path
+            {
+                r.colors_in = Some(*colors);
+            }
             r.size_in = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(r.size_in);
             r.status = Status::Queued;
         }
@@ -587,13 +640,14 @@ impl App {
                                 Outcome::Optimized { colors, .. }
                                 | Outcome::AlreadyOptimal { colors, .. }
                                 | Outcome::Skipped { colors, .. },
-                            ) => fmt_count(*colors),
-                            _ => "—".into(),
+                            ) => (fmt_count(*colors), p.text_muted),
+                            // Not processed yet: the file's current color count, dimmer.
+                            _ => (r.colors_in.map_or("—".into(), fmt_count), p.text_faint),
                         };
                         if compact {
                             cells.remove(0); // no "In" column
                         } else {
-                            cells.push((colors, p.text_muted));
+                            cells.push(colors);
                         }
                         for (text, color) in cells {
                             row.col(|ui| {
@@ -611,7 +665,7 @@ impl App {
                             let cell = ui.max_rect();
                             if let Some((label, tone)) = status_badge(&r.status) {
                                 let rect = pill(ui, egui::pos2(cell.left() + CELL_PAD, cell.center().y), label, tone);
-                                if let Some(why) = status_hint(&r.status) {
+                                if let Some(why) = status_hint(&r.status, r.colors_in) {
                                     ui.interact(rect, ui.id().with(("status", i)), Sense::hover()).on_hover_text(why);
                                 }
                             }
@@ -704,6 +758,7 @@ impl eframe::App for App {
         }
         system::theme(dark, self.accent).install(&ctx);
         self.poll();
+        self.poll_scan();
 
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() {
@@ -954,7 +1009,7 @@ fn colors_label(c: u32) -> String {
 }
 
 /// Explanation shown when hovering a status pill.
-fn status_hint(s: &Status) -> Option<String> {
+fn status_hint(s: &Status, colors_in: Option<usize>) -> Option<String> {
     Some(match s {
         Status::Error(e) => e.clone(),
         Status::Done(Outcome::Optimized { note, output, converted, first_frame, colors, quantized, .. }) => {
@@ -964,6 +1019,9 @@ fn status_hint(s: &Status) -> Option<String> {
             } else {
                 format!("\n{colors} colors (lossless)")
             };
+            if let Some(n) = colors_in {
+                hint += &format!(", originally {n}");
+            }
             if *converted {
                 hint += "\n\nConverted to PNG; the original file was kept.";
             }
